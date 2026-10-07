@@ -1,0 +1,97 @@
+name: Cinny 4.12.7 with notification fix
+on:
+  workflow_dispatch:
+  push:
+    branches: ['build/v4.12.7-pr612']
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x86_64
+          - platform: macos-latest
+            target: universal-apple-darwin
+            name: macos-universal
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || 'x86_64-pc-windows-msvc' }}
+      - run: npm ci
+      - run: npm ci
+        working-directory: cinny
+      - name: Verify permission bridge and native plugin setup
+        run: node scripts/check-notification-bridge.cjs
+      - name: Build release installers without updater artifact signatures
+        run: npm run tauri build -- --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        env:
+          NODE_OPTIONS: --max_old_space_size=4096
+      - name: Verify release files and prepare build metadata
+        shell: python
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: |
+          import os, pathlib, subprocess, hashlib, datetime, json, shutil
+          root = pathlib.Path('src-tauri/target') / os.environ['BUILD_TARGET'] / 'release'
+          out = pathlib.Path('release-output'); out.mkdir()
+          binary = root / ('cinny.exe' if os.name == 'nt' else 'bundle/macos/Cinny.app/Contents/MacOS/cinny')
+          data = binary.read_bytes()
+          assert len(data) > 1000000
+          for marker in [b'__tauriNotificationPermissionStatus', b'plugin:notification|request_permission', b'plugin:notification|notify']:
+              assert marker in data, marker
+          if os.name == 'nt':
+              installers = list((root/'bundle/msi').glob('*.msi')) + list((root/'bundle/nsis').glob('*.exe'))
+          else:
+              installers = list((root/'bundle/dmg').glob('*.dmg'))
+              app = root/'bundle/macos/Cinny.app'
+              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(out/'Cinny_4.12.7_PR612_universal.app.zip')], check=True)
+          assert installers
+          for file in installers:
+              assert file.stat().st_size > 1000000
+              shutil.copy2(file, out/file.name)
+          try:
+              process = subprocess.Popen([str(binary.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              try:
+                  code = process.wait(timeout=10)
+                  raise RuntimeError(f'Application exited unexpectedly with code {code}')
+              except subprocess.TimeoutExpired:
+                  process.terminate(); process.wait(timeout=10)
+                  smoke = 'Process remained running for 10 seconds on native runner; notification delivery not manually tested.'
+          except Exception as error:
+              smoke = f'Native startup smoke test failed: {error}'
+              raise
+          base = 'd3627de8792ff1b3bba74aecbee3a503ce75ad35'
+          pr = '9948bf078f6d27e15f1ac9241ec4006059d4f43d'
+          info = f'''Cinny Desktop v4.12.7 + PR #612
+          Base commit: {base}
+          PR commit: {pr}
+          Source commit: {subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
+          Build date UTC: {datetime.datetime.now(datetime.timezone.utc).isoformat()}
+          Target: {os.environ['BUILD_TARGET']}
+          Signing: No Windows Authenticode / Apple Developer signing or notarization requested; Apple Silicon may have an ad-hoc linker signature.
+          Integration: PR cherry-picked, then corrected Web Notification default / Permissions API prompt mapping.
+          Validation: IPC contract checked with mocks; native plugin initialization and localhost capabilities inspected; PR-specific JS strings verified in release binary.
+          Startup test: {smoke}
+          Sound: Original Cinny frontend settings unchanged. Actual native Notify silent/loud behavior requires interactive validation.
+          Unsigned macOS: Extract the app and copy to Applications, then Open Anyway in System Settings > Privacy & Security if Gatekeeper blocks it.
+          '''
+          (out/'BUILD_INFO.txt').write_text(info, encoding='utf-8')
+          lines = [hashlib.sha256(p.read_bytes()).hexdigest() + '  ' + p.name for p in out.iterdir() if p.is_file()]
+          (out/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cinny-4.12.7-pr612-${{ matrix.name }}
+          path: release-output/*
+          if-no-files-found: error

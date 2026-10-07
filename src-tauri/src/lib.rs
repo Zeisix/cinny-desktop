@@ -137,8 +137,8 @@ pub fn run() {
                             return window.__TAURI_INTERNALS__.invoke('plugin:notification|is_permission_granted')
                                 .then(function(isGranted) {
                                     const state = isGranted ? 'granted' : (window.__tauriNotificationPermission === 'denied' ? 'denied' : 'prompt');
-                                    window.__tauriNotificationPermission = state;
-                                    
+                                    window.__tauriNotificationPermission = state === 'prompt' ? 'default' : state;
+
                                     if (!window.__tauriNotificationPermissionStatus) {
                                         window.__tauriNotificationPermissionStatus = {
                                             name: 'notifications',
