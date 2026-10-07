@@ -1,4 +1,4 @@
-name: Cinny 4.12.7 with notification fix, updater disabled
+name: Cinny 4.12.7 notification startup fix, updater disabled
 on:
   workflow_dispatch:
   push:
@@ -49,7 +49,7 @@ jobs:
           binary = root / ('cinny.exe' if os.name == 'nt' else 'bundle/macos/Cinny.app/Contents/MacOS/cinny')
           data = binary.read_bytes()
           assert len(data) > 1000000
-          for marker in [b'__tauriNotificationPermissionStatus', b'plugin:notification|request_permission', b'plugin:notification|notify']:
+          for marker in [b'__tauriNotificationPermissionStatus', b'__tauriNotificationPermissionReady', b'plugin:notification|request_permission', b'plugin:notification|notify']:
               assert marker in data, marker
           assert b'Would you like to update now?' not in data, 'Automatic update dialog remains in binary'
           if os.name == 'nt':
@@ -57,11 +57,37 @@ jobs:
           else:
               installers = list((root/'bundle/dmg').glob('*.dmg'))
               app = root/'bundle/macos/Cinny.app'
-              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(out/'Cinny_4.12.7_PR612_no-updater_universal.app.zip')], check=True)
+              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(out/'Cinny_4.12.7_PR612_startup-fix_no-updater_universal.app.zip')], check=True)
           assert installers
+          if os.name == 'nt':
+              extraction = pathlib.Path('msi-verification').resolve()
+              extraction.mkdir()
+              msi = next(file for file in installers if file.suffix == '.msi')
+              subprocess.run(['msiexec', '/a', str(msi.resolve()), '/qn', f'TARGETDIR={extraction}'], check=True)
+              extracted = list(extraction.rglob('cinny.exe'))
+              assert len(extracted) == 1 and extracted[0].read_bytes() == data, 'MSI payload differs from checked application'
+          else:
+              import struct
+              assert data[:4] == bytes.fromhex('cafebabe'), 'Expected universal Mach-O'
+              cpus = set()
+              for i in range(struct.unpack_from('>I', data, 4)[0]):
+                  cpu, subtype, offset, size, align = struct.unpack_from('>IIIII', data, 8+i*20)
+                  cpus.add(cpu)
+                  part = data[offset:offset+size]
+                  assert b'__tauriNotificationPermissionReady' in part, 'Startup fix missing from architecture'
+                  assert b'Would you like to update now?' not in part
+              assert cpus == {0x01000007, 0x0100000c}, 'Both Intel and Apple Silicon required'
+              mount = pathlib.Path('dmg-verification').resolve()
+              mount.mkdir()
+              dmg = next(file for file in installers if file.suffix == '.dmg')
+              subprocess.run(['hdiutil', 'attach', '-nobrowse', '-readonly', '-mountpoint', str(mount), str(dmg.resolve())], check=True, stdout=subprocess.DEVNULL)
+              try:
+                  assert (mount/'Cinny.app/Contents/MacOS/cinny').read_bytes() == data, 'DMG payload differs from checked application'
+              finally:
+                  subprocess.run(['hdiutil', 'detach', str(mount)], check=True, stdout=subprocess.DEVNULL)
           for file in installers:
               assert file.stat().st_size > 1000000
-              shutil.copy2(file, out/(file.stem + '_PR612_no-updater' + file.suffix))
+              shutil.copy2(file, out/(file.stem + '_PR612_startup-fix_no-updater' + file.suffix))
           try:
               process = subprocess.Popen([str(binary.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
               try:
@@ -82,9 +108,9 @@ jobs:
           Build date UTC: {datetime.datetime.now(datetime.timezone.utc).isoformat()}
           Target: {os.environ['BUILD_TARGET']}
           Signing: No Windows Authenticode / Apple Developer signing or notarization requested; Apple Silicon may have an ad-hoc linker signature.
-          Integration: PR cherry-picked, then corrected Web Notification default / Permissions API prompt mapping.
+          Integration: Full original PR merged into stable v4.12.7; corrected default/prompt mapping and initialize native notification permission at every startup so opening Settings or using the console is unnecessary.
           Updater: Official 0001-disable-tauri-updater.patch applied. Default Cargo features exclude updater, compiling out plugin registration, startup check, dialog and automatic installation.
-          Validation: IPC contract checked with mocks; native plugin initialization and localhost capabilities inspected; PR-specific JS strings verified in release binary.
+          Validation: Exact previous startup failure reproduced with mocked IPC; cold launch and restart regression tests pass; native MSI/DMG payload verified against checked executable; new startup permission code and no-updater condition verified in both macOS architectures.
           Startup test: {smoke}
           Sound: Original Cinny frontend settings unchanged. Actual native Notify silent/loud behavior requires interactive validation.
           Unsigned macOS: Extract the app and copy to Applications, then Open Anyway in System Settings > Privacy & Security if Gatekeeper blocks it.
@@ -94,6 +120,10 @@ jobs:
           (out/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: cinny-4.12.7-pr612-no-updater-${{ matrix.name }}
-          path: release-output/*
+          name: cinny-4.12.7-pr612-startup-fix-no-updater-${{ matrix.name }}
+          path: |
+            release-output/*.exe
+            release-output/*.msi
+            release-output/*.dmg
+            release-output/*.txt
           if-no-files-found: error

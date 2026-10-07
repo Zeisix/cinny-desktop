@@ -13,6 +13,7 @@ async function scenario(granted, requested) {
     if (command.endsWith('request_permission')) return requested;
   }}};
   vm.runInNewContext(script, {window, navigator, console});
+  await window.__tauriNotificationPermissionReady;
   return {window, navigator, calls};
 }
 
@@ -44,6 +45,16 @@ async function scenario(granted, requested) {
   assert.equal(await b.window.Notification.requestPermission(), 'denied');
   assert.equal(b.window.Notification.permission, 'denied');
   const c = await scenario(true, 'granted');
+  // A cold launch must work before visiting Settings or calling requestPermission.
+  assert.equal(c.window.Notification.permission, 'granted');
+  assert.equal(c.calls.filter(call => call.command.endsWith('is_permission_granted')).length, 1);
+  assert(!c.calls.some(call => call.command.endsWith('request_permission')));
+  if (c.window.Notification.permission === 'granted') {
+    new c.window.Notification('Cold launch message', {body: 'No console workaround'});
+  }
+  assert(c.calls.some(call => call.command.endsWith('|notify')), 'Cold launch message was suppressed');
+  const restarted = await scenario(true, 'granted');
+  assert.equal(restarted.window.Notification.permission, 'granted', 'Permission was lost on restart');
   assert.equal((await c.navigator.permissions.query({name: 'notifications'})).state, 'granted');
   assert.equal(c.window.Notification.permission, 'granted');
   console.log(JSON.stringify({date: new Date().toISOString(), tests: 'IPC routing and Cinny permission-state update passed with mocked Tauri IPC', nativeRuntimeTest: 'NOT RUN', findings}, null, 2));

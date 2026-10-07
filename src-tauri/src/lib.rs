@@ -131,6 +131,24 @@ pub fn run() {
                     }
                     window.Notification = TauriNotification;
 
+                    // Populate the permission cache on every launch, before Cinny checks it
+                    // for incoming messages. The settings screen may never be opened.
+                    window.__tauriNotificationPermissionReady = window.__TAURI_INTERNALS__
+                        .invoke('plugin:notification|is_permission_granted')
+                        .then(function(isGranted) {
+                            if (isGranted && window.__tauriNotificationPermission !== 'denied') {
+                                window.__tauriNotificationPermission = 'granted';
+                                const status = window.__tauriNotificationPermissionStatus;
+                                if (status && status.state !== 'granted') {
+                                    status.state = 'granted';
+                                    if (typeof status.onchange === 'function') {
+                                        status.onchange.call(status);
+                                    }
+                                }
+                            }
+                        })
+                        .catch(console.error);
+
                     const originalQuery = navigator.permissions.query;
                     navigator.permissions.query = function(parameters) {
                         if (parameters && parameters.name === 'notifications') {
