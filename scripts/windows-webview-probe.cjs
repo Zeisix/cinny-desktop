@@ -5,21 +5,27 @@ const assert = require('node:assert/strict');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function connect() {
+  let observed;
+  let failure;
   for (let attempt = 0; attempt < 90; attempt++) {
     try {
       const targets = await (await fetch('http://127.0.0.1:9222/json/list')).json();
-      const page = targets.find(target => target.type === 'page' && target.url.startsWith('http://localhost:44548'));
+      observed = targets;
+      const page = targets.find(target => target.type === 'page');
       if (page) return page;
-    } catch {}
+    } catch (error) { failure = error.message; }
     await delay(1000);
   }
-  throw new Error('Cinny WebView2 debugging target did not appear');
+  throw new Error('Cinny WebView2 debugging target did not appear: '+JSON.stringify({observed, failure}));
 }
 
 async function inspect(binary, iteration) {
   const process = spawn(binary, [], {env: {...global.process.env,
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: '--remote-debugging-port=9222',
-  }, stdio: 'ignore'});
+  }, stdio: ['ignore', 'pipe', 'pipe']});
+  process.stdout.on('data', data => console.log('Cinny stdout:', data.toString()));
+  process.stderr.on('data', data => console.log('Cinny stderr:', data.toString()));
+  process.on('exit', code => console.log('Cinny exit:', code));
   let socket;
   try {
     const target = await connect();
