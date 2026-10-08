@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-notification-startup-report"
+description = "Allow the native build regression report; the command remains disabled unless the test report environment variable is set."
+commands.allow = ["notification_startup_report"]

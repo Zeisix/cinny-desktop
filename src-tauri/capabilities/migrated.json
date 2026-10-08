@@ -63,6 +63,7 @@
     "dialog:allow-confirm",
     "http:default",
     "notification:default",
+    "allow-notification-startup-report",
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-register-all",
