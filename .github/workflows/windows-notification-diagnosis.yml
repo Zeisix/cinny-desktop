@@ -1,0 +1,36 @@
+name: Diagnose notification state in actual Windows WebView2
+on:
+  push:
+    branches: ['build/v4.12.7-pr612']
+    paths: ['scripts/windows-webview-probe.cjs', '.github/workflows/windows-notification-diagnosis.yml']
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Download exact previous startup-fix installer
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://nightly.link/Zeisix/cinny-desktop/actions/artifacts/11492171077.zip' -OutFile previous.zip
+          Expand-Archive previous.zip previous
+          $msi = (Get-ChildItem previous -Filter *.msi).FullName
+          $destination = Join-Path $pwd 'previous-app'
+          $p = Start-Process msiexec -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$destination`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "MSI extraction failed: $($p.ExitCode)" }
+          $binary = (Get-ChildItem previous-app -Recurse -Filter cinny.exe).FullName
+          "CINNY_PROBE_BINARY=$binary" >> $env:GITHUB_ENV
+      - name: Inspect real cold-launch and restart state
+        run: node scripts/windows-webview-probe.cjs "$env:CINNY_PROBE_BINARY"
+        env:
+          CINNY_PROBE_DIAGNOSE: '1'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: windows-real-webview-diagnosis
+          path: windows-webview-*.json

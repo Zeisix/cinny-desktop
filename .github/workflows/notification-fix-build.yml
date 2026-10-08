@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches: ['build/v4.12.7-pr612']
+    paths: ['src-tauri/**', 'scripts/check-notification-bridge.cjs']
 permissions:
   contents: read
 jobs:
