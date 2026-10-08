@@ -43,7 +43,9 @@ jobs:
             $setup = Start-Process .\webview2-setup.exe -ArgumentList '/silent /install' -Wait -PassThru
             Write-Output "WebView2 installer result: $($setup.ExitCode)"
           }
-          Get-Item $paths -ErrorAction Stop | Select-Object FullName, @{Name='Version';Expression={$_.VersionInfo.FileVersion}}
+          $runtimes = Get-Item $paths -ErrorAction SilentlyContinue
+          if (-not $runtimes) { throw 'WebView2 runtime not available after installation' }
+          $runtimes | Select-Object FullName, @{Name='Version';Expression={$_.VersionInfo.FileVersion}}
       - name: Verify permission bridge and native plugin setup
         run: node scripts/check-notification-bridge.cjs
       - name: Build release installers with updater disabled
