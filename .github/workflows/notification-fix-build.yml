@@ -1,4 +1,4 @@
-name: Cinny 4.12.7 notification startup fix, updater disabled
+name: Cinny 4.12.7 native startup r2, updater disabled
 on:
   workflow_dispatch:
   push:
@@ -7,7 +7,6 @@ permissions:
   contents: read
 jobs:
   build:
-    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +49,7 @@ jobs:
           binary = root / ('cinny.exe' if os.name == 'nt' else 'bundle/macos/Cinny.app/Contents/MacOS/cinny')
           data = binary.read_bytes()
           assert len(data) > 1000000
-          for marker in [b'__tauriNotificationPermissionStatus', b'__tauriNotificationPermissionReady', b'plugin:notification|request_permission', b'plugin:notification|notify']:
+          for marker in [b'__tauriNotificationPermissionStatus', b'__tauriNotificationPermissionReady', b'native-startup-r2', b'plugin:notification|request_permission', b'plugin:notification|notify']:
               assert marker in data, marker
           assert b'Would you like to update now?' not in data, 'Automatic update dialog remains in binary'
           if os.name == 'nt':
@@ -58,7 +57,6 @@ jobs:
           else:
               installers = list((root/'bundle/dmg').glob('*.dmg'))
               app = root/'bundle/macos/Cinny.app'
-              subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(out/'Cinny_4.12.7_PR612_startup-fix_no-updater_universal.app.zip')], check=True)
           assert installers
           if os.name == 'nt':
               extraction = pathlib.Path('msi-verification').resolve()
@@ -75,7 +73,7 @@ jobs:
                   cpu, subtype, offset, size, align = struct.unpack_from('>IIIII', data, 8+i*20)
                   cpus.add(cpu)
                   part = data[offset:offset+size]
-                  assert b'__tauriNotificationPermissionReady' in part, 'Startup fix missing from architecture'
+                  assert b'native-startup-r2' in part, 'Startup fix missing from architecture'
                   assert b'Would you like to update now?' not in part
               assert cpus == {0x01000007, 0x0100000c}, 'Both Intel and Apple Silicon required'
               mount = pathlib.Path('dmg-verification').resolve()
@@ -88,18 +86,32 @@ jobs:
                   subprocess.run(['hdiutil', 'detach', str(mount)], check=True, stdout=subprocess.DEVNULL)
           for file in installers:
               assert file.stat().st_size > 1000000
-              shutil.copy2(file, out/(file.stem + '_PR612_startup-fix_no-updater' + file.suffix))
-          try:
-              process = subprocess.Popen([str(binary.resolve())], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              shutil.copy2(file, out/(file.stem + '_PR612_native-startup-r2_no-updater' + file.suffix))
+          reports = []
+          for iteration in ['cold', 'restart']:
+              report_path = pathlib.Path(f'native-notification-{iteration}.json').resolve()
+              environment = dict(os.environ, CINNY_NOTIFICATION_TEST_REPORT=str(report_path))
+              process = subprocess.Popen([str(binary.resolve())], env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
               try:
-                  code = process.wait(timeout=10)
-                  raise RuntimeError(f'Application exited unexpectedly with code {code}')
-              except subprocess.TimeoutExpired:
+                  import time
+                  deadline = time.monotonic() + 60
+                  while not report_path.exists() and time.monotonic() < deadline:
+                      assert process.poll() is None, 'Application exited before WebView initialized'
+                      time.sleep(0.5)
+                  assert report_path.exists(), 'Native WebView startup did not produce report'
+                  report = json.loads(report_path.read_text())
+                  assert report['revision'] == 'native-startup-r2', report
+                  assert report['className'] == 'TauriNotification', report
+                  assert report['permissionBeforeAnyRequest'] == 'granted', report
+                  assert report.get('nativeNotifyResolved') is True and 'error' not in report, report
+                  reports.append(report)
+                  print(json.dumps({'iteration': iteration, 'native_webview': report}), flush=True)
+              finally:
                   process.terminate(); process.wait(timeout=10)
-                  smoke = 'Process remained running for 10 seconds on native runner; notification delivery not manually tested.'
-          except Exception as error:
-              smoke = f'Native startup smoke test failed: {error}'
-              raise
+                  if os.name == 'nt':
+                      subprocess.run(['taskkill', '/F', '/IM', 'cinny.exe', '/T'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                  time.sleep(2)
+          smoke = 'Real native WebView cold launch and restart: permission granted before any requestPermission; native notification IPC resolved. OS banner visibility not manually verified.'
           base = 'd3627de8792ff1b3bba74aecbee3a503ce75ad35'
           pr = '9948bf078f6d27e15f1ac9241ec4006059d4f43d'
           info = f'''Cinny Desktop v4.12.7 + PR #612, updater disabled
@@ -109,9 +121,9 @@ jobs:
           Build date UTC: {datetime.datetime.now(datetime.timezone.utc).isoformat()}
           Target: {os.environ['BUILD_TARGET']}
           Signing: No Windows Authenticode / Apple Developer signing or notarization requested; Apple Silicon may have an ad-hoc linker signature.
-          Integration: Full original PR merged into stable v4.12.7; corrected default/prompt mapping and initialize native notification permission at every startup so opening Settings or using the console is unnecessary.
+          Integration: Full original PR merged into stable v4.12.7. Native permission is resolved in Rust before the frontend runs, eliminating early IPC/cache dependency; the upstream plugin bootstrap can no longer overwrite the bridge or throw on its permission property. Revision native-startup-r2.
           Updater: Official 0001-disable-tauri-updater.patch applied. Default Cargo features exclude updater, compiling out plugin registration, startup check, dialog and automatic installation.
-          Validation: Exact previous startup failure reproduced with mocked IPC; cold launch and restart regression tests pass; native MSI/DMG payload verified against checked executable; new startup permission code and no-updater condition verified in both macOS architectures.
+          Validation: Combined upstream-plugin/bridge startup regression tested (including late Windows permission write); real native WebView cold-launch and restart permission/IPC tests pass; native MSI/DMG payload verified against checked executable; new startup permission code and no-updater condition verified in both macOS architectures.
           Startup test: {smoke}
           Sound: Original Cinny frontend settings unchanged. Actual native Notify silent/loud behavior requires interactive validation.
           Unsigned macOS: Extract the app and copy to Applications, then Open Anyway in System Settings > Privacy & Security if Gatekeeper blocks it.
@@ -121,39 +133,10 @@ jobs:
           (out/'SHA256SUMS.txt').write_text('\n'.join(lines)+'\n')
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: cinny-4.12.7-pr612-startup-fix-no-updater-${{ matrix.name }}
+          name: cinny-4.12.7-pr612-native-startup-r2-no-updater-${{ matrix.name }}
           path: |
             release-output/*.exe
             release-output/*.msi
             release-output/*.dmg
             release-output/*.txt
           if-no-files-found: error
-
-  diagnose:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version-file: .node-version
-          package-manager-cache: false
-      - name: Download exact previous startup-fix installer
-        shell: pwsh
-        run: |
-          Invoke-WebRequest 'https://nightly.link/Zeisix/cinny-desktop/actions/artifacts/11492171077.zip' -OutFile previous.zip
-          Expand-Archive previous.zip previous
-          $msi = (Get-ChildItem previous -Filter *.msi).FullName
-          $destination = Join-Path $pwd 'previous-app'
-          $p = Start-Process msiexec -ArgumentList "/a `"$msi`" /qn TARGETDIR=`"$destination`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "MSI extraction failed: $($p.ExitCode)" }
-          $binary = (Get-ChildItem previous-app -Recurse -Filter cinny.exe).FullName
-          "CINNY_PROBE_BINARY=$binary" >> $env:GITHUB_ENV
-      - name: Inspect real cold-launch and restart state
-        run: node scripts/windows-webview-probe.cjs "$env:CINNY_PROBE_BINARY"
-        env:
-          CINNY_PROBE_DIAGNOSE: '1'
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: windows-real-webview-diagnosis
-          path: windows-webview-*.json

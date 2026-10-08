@@ -7,6 +7,16 @@
 
 use tauri::{webview::{NewWindowResponse, WebviewWindowBuilder}, WebviewUrl, TitleBarStyle};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_notification::{NotificationExt, PermissionState};
+
+// Native-runner regression reporting is inactive during normal application use.
+#[tauri::command]
+fn notification_startup_report(report: serde_json::Value) -> Result<(), String> {
+    let path = std::env::var("CINNY_NOTIFICATION_TEST_REPORT")
+        .map_err(|_| "Native notification regression reporting is disabled".to_string())?;
+    std::fs::write(path, serde_json::to_vec_pretty(&report).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
 
 #[cfg(feature = "updater")]
 use tauri_plugin_updater::UpdaterExt;
@@ -45,6 +55,7 @@ pub fn run() {
     }
 
     builder
+        .invoke_handler(tauri::generate_handler![notification_startup_report])
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_localhost::Builder::new(port).build())
@@ -96,29 +107,46 @@ pub fn run() {
                 WebviewUrl::External(url)
             };
 
+            // Resolve the desktop plugin state natively before frontend code runs.
+            // An IPC request at document-start can race registration of the WebView.
+            let notification_permission = match app.notification().permission_state()? {
+                PermissionState::Granted => "granted",
+                PermissionState::Denied => "denied",
+                _ => "default",
+            };
             let init_script = r#"
                 if (window.__TAURI_INTERNALS__) {
+                    window.__tauriNotificationPermission = '__CINNY_NATIVE_NOTIFICATION_PERMISSION__';
+                    window.__cinnyNotificationBridgeRevision = 'native-startup-r2';
                     class TauriNotification {
                         constructor(title, options) {
                             this.title = title;
                             this.options = options || {};
-                            window.__TAURI_INTERNALS__.invoke('plugin:notification|notify', {
+                            this.ready = window.__TAURI_INTERNALS__.invoke('plugin:notification|notify', {
                                 options: {
                                     title: this.title,
                                     body: this.options.body || '',
                                     icon: this.options.icon || '',
                                 }
-                            }).catch(console.error);
+                            });
+                            this.ready.catch(console.error);
                         }
                         static get permission() {
                             return window.__tauriNotificationPermission || 'default';
                         }
+                        static set permission(_permission) {
+                            // The upstream plugin's asynchronous bootstrap writes through
+                            // window.Notification after this class replaces it. Its Windows
+                            // browser-cache result is not the native permission state.
+                            // Ignore that stale write; only native results update our cache.
+                        }
                         static requestPermission() {
                             return window.__TAURI_INTERNALS__.invoke('plugin:notification|request_permission')
                                 .then(function(permission) {
+                                    permission = permission === 'prompt' || permission === 'prompt-with-rationale' ? 'default' : permission;
                                     window.__tauriNotificationPermission = permission;
                                     if (window.__tauriNotificationPermissionStatus) {
-                                        window.__tauriNotificationPermissionStatus.state = permission;
+                                        window.__tauriNotificationPermissionStatus.state = permission === 'default' ? 'prompt' : permission;
                                         if (typeof window.__tauriNotificationPermissionStatus.onchange === 'function') {
                                             window.__tauriNotificationPermissionStatus.onchange.call(window.__tauriNotificationPermissionStatus);
                                         }
@@ -131,23 +159,7 @@ pub fn run() {
                     }
                     window.Notification = TauriNotification;
 
-                    // Populate the permission cache on every launch, before Cinny checks it
-                    // for incoming messages. The settings screen may never be opened.
-                    window.__tauriNotificationPermissionReady = window.__TAURI_INTERNALS__
-                        .invoke('plugin:notification|is_permission_granted')
-                        .then(function(isGranted) {
-                            if (isGranted && window.__tauriNotificationPermission !== 'denied') {
-                                window.__tauriNotificationPermission = 'granted';
-                                const status = window.__tauriNotificationPermissionStatus;
-                                if (status && status.state !== 'granted') {
-                                    status.state = 'granted';
-                                    if (typeof status.onchange === 'function') {
-                                        status.onchange.call(status);
-                                    }
-                                }
-                            }
-                        })
-                        .catch(console.error);
+                    window.__tauriNotificationPermissionReady = Promise.resolve(window.Notification.permission);
 
                     const originalQuery = navigator.permissions.query;
                     navigator.permissions.query = function(parameters) {
@@ -178,12 +190,40 @@ pub fn run() {
                         return originalQuery.call(navigator.permissions, parameters);
                     };
                 }
-            "#;
+            "#.replace("__CINNY_NATIVE_NOTIFICATION_PERMISSION__", notification_permission);
 
             let app_handle = app.handle().clone();
             let window_builder = WebviewWindowBuilder::new(app, "main".to_string(), window_url)
                 .title("Cinny")
                 .initialization_script(init_script)
+                .on_page_load(|webview, payload| {
+                    if payload.event() == tauri::webview::PageLoadEvent::Finished
+                        && std::env::var_os("CINNY_NOTIFICATION_TEST_REPORT").is_some()
+                    {
+                        let _ = webview.eval(r#"
+                            (async function() {
+                                const report = {
+                                    revision: window.__cinnyNotificationBridgeRevision,
+                                    className: window.Notification.name,
+                                    permissionBeforeAnyRequest: window.Notification.permission,
+                                    url: location.origin,
+                                };
+                                try {
+                                    await window.__tauriNotificationPermissionReady;
+                                    const notification = new window.Notification('Cinny native startup regression', {
+                                        body: 'Native IPC after cold launch, no requestPermission workaround',
+                                        silent: true,
+                                    });
+                                    await notification.ready;
+                                    report.nativeNotifyResolved = true;
+                                } catch (error) {
+                                    report.error = String(error);
+                                }
+                                await window.__TAURI_INTERNALS__.invoke('notification_startup_report', {report});
+                            })().catch(console.error);
+                        "#);
+                    }
+                })
                 .disable_drag_drop_handler()
                 .on_new_window(move |url, _features| {
                     let _ = app_handle.opener().open_url(url.as_str(), None::<&str>);
