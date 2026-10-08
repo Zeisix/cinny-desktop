@@ -114,6 +114,9 @@ pub fn run() {
                 PermissionState::Denied => "denied",
                 _ => "default",
             };
+            if let Ok(path) = std::env::var("CINNY_NOTIFICATION_TEST_REPORT") {
+                let _ = std::fs::write(format!("{path}.native.log"), format!("native permission: {notification_permission}\n"));
+            }
             let init_script = r#"
                 if (window.__TAURI_INTERNALS__) {
                     window.__tauriNotificationPermission = '__CINNY_NATIVE_NOTIFICATION_PERMISSION__';
@@ -197,6 +200,12 @@ pub fn run() {
                 .title("Cinny")
                 .initialization_script(init_script)
                 .on_page_load(|webview, payload| {
+                    if let Ok(path) = std::env::var("CINNY_NOTIFICATION_TEST_REPORT") {
+                        use std::io::Write;
+                        if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{path}.native.log")) {
+                            let _ = writeln!(log, "page load: {:?}, url: {}", payload.event(), payload.url());
+                        }
+                    }
                     if payload.event() == tauri::webview::PageLoadEvent::Finished
                         && std::env::var_os("CINNY_NOTIFICATION_TEST_REPORT").is_some()
                     {
